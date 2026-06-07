@@ -1,103 +1,120 @@
-// Telegram forum-topic video limiter bot
+// Cloudflare Worker Telegram bot: forum-topic video limiter
 //
-// What it does:
-// - Exempts selected topics (like General, Chatroom, Request) from counting
-// - Counts video posts per user per topic in all other forum topics
-// - After a user reaches the limit, the bot restricts that user so they can still send text
-//   but cannot send videos/media in the group
+// What this Worker does:
+// - Receives Telegram updates via webhook
+// - Exempts selected topics (for example General / Chatroom / Request)
+// - Counts only VIDEO messages in non-exempt topics
+// - When a user passes the limit, restricts that user so text is still allowed
+//   but media (videos/photos/documents/etc.) is blocked at the chat level
 //
-// Install:
-//   npm i telegraf dotenv
+// Cloudflare setup needed:
+// 1) Add a KV namespace binding named STATE
+// 2) Add secrets / vars in Worker settings:
+//    - BOT_TOKEN (secret)
+//    - WEBHOOK_SECRET (secret, any random string)
+//    - LIMIT (var, example: 3)
+//    - EXEMPT_TOPICS (var, optional CSV topic ids, example: 1,12,34)
 //
-// Run:
-//   BOT_TOKEN=123456:ABC... LIMIT=3 node telegram_video_limit_bot.js
-//
-// Important setup in Telegram:
-// - Add the bot to the group as an admin
-// - Give it permission to restrict members
-// - For best results, disable privacy mode in BotFather or make the bot an admin so it can see messages
-//
-// Notes:
-// - Telegram forum-topic messages are identified by message_thread_id.
-// - The bot can only restrict permissions at the chat level, not per-topic.
-//   So once someone is restricted, the media block applies to the whole group chat.
+// Important Telegram notes:
+// - The bot must be an admin in the supergroup and have permission to restrict members
+// - Telegram forum topics are identified by message_thread_id
+// - The General topic can be exempted by putting its thread id in EXEMPT_TOPICS
+// - This code uses a webhook, which is the correct model for Cloudflare Workers
 
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const { Telegraf } = require('telegraf');
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 
-const TOKEN = process.env.BOT_TOKEN;
-if (!TOKEN) {
-  throw new Error('Missing BOT_TOKEN environment variable.');
+function json(data, init = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    ...init,
+    headers: { ...JSON_HEADERS, ...(init.headers || {}) },
+  });
 }
 
-const LIMIT = parseInt(process.env.LIMIT || '3', 10);
-const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
-const bot = new Telegraf(TOKEN);
-
-// Exempt topics by thread ID.
-// General is often thread ID 1 in forums, and we also treat missing thread_id as exempt
-// so the bot does not count normal non-topic messages.
-const DEFAULT_EXEMPT_TOPICS = new Set([1]);
-
-function loadState() {
-  try {
-    if (!fs.existsSync(STATE_FILE)) {
-      return { exemptTopics: [1], counts: {}, restrictedUsers: {} };
-    }
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    return {
-      exemptTopics: Array.isArray(data.exemptTopics) ? data.exemptTopics : [1],
-      counts: data.counts && typeof data.counts === 'object' ? data.counts : {},
-      restrictedUsers: data.restrictedUsers && typeof data.restrictedUsers === 'object' ? data.restrictedUsers : {},
-    };
-  } catch (err) {
-    console.error('Failed to load state:', err);
-    return { exemptTopics: [1], counts: {}, restrictedUsers: {} };
-  }
+function text(body, init = {}) {
+  return new Response(body, { ...init, headers: init.headers || {} });
 }
 
-function saveState() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    console.error('Failed to save state:', err);
-  }
+function parseCsvIds(value) {
+  if (!value) return [];
+  return String(value)
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n));
 }
 
-const state = loadState();
-
-function getThreadId(ctx) {
-  const threadId = ctx.message?.message_thread_id ?? ctx.channelPost?.message_thread_id ?? null;
-  return threadId;
+function getThreadId(message) {
+  return typeof message?.message_thread_id === 'number' ? message.message_thread_id : null;
 }
 
-function isForumMessage(ctx) {
-  return typeof getThreadId(ctx) === 'number';
+function getLimit(env) {
+  const n = Number(env.LIMIT ?? 3);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
 }
 
-function isExemptTopic(threadId) {
+function getExemptTopics(env) {
+  // Add your topic IDs here in the dashboard, e.g. "1,12,34"
+  return new Set(parseCsvIds(env.EXEMPT_TOPICS));
+}
+
+function isExemptTopic(threadId, exemptSet) {
+  // Messages not inside a topic are treated as exempt
   if (threadId == null) return true;
-  return DEFAULT_EXEMPT_TOPICS.has(threadId) || state.exemptTopics.includes(threadId);
+  return exemptSet.has(threadId);
 }
 
-function getTopicKey(chatId, threadId) {
-  return `${chatId}:${threadId ?? 'general'}`;
+async function telegram(env, method, payload) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok || !data?.ok) {
+    const desc = data?.description || `HTTP ${res.status}`;
+    throw new Error(`${method} failed: ${desc}`);
+  }
+
+  return data.result;
 }
 
-function getUserKey(chatId, userId, threadId) {
-  return `${chatId}:${userId}:${threadId ?? 'general'}`;
+async function kvGetJSON(env, key) {
+  const raw = await env.STATE.get(key);
+  return raw ? JSON.parse(raw) : null;
 }
 
-async function applyMediaRestriction(ctx, userId) {
-  // Restrict only media, keep text allowed.
-  // Telegram permissions are chat-wide.
-  await ctx.telegram.restrictChatMember(
-    ctx.chat.id,
-    userId,
-    {
+async function kvPutJSON(env, key, value) {
+  await env.STATE.put(key, JSON.stringify(value));
+}
+
+function countKey(chatId, userId, threadId) {
+  return `count:${chatId}:${userId}:${threadId ?? 'general'}`;
+}
+
+function restrictedKey(chatId, userId) {
+  return `restricted:${chatId}:${userId}`;
+}
+
+async function isAdmin(env, chatId, userId) {
+  const member = await telegram(env, 'getChatMember', {
+    chat_id: chatId,
+    user_id: userId,
+  });
+  return ['creator', 'administrator'].includes(member.status);
+}
+
+async function restrictMediaOnly(env, chatId, userId) {
+  await telegram(env, 'restrictChatMember', {
+    chat_id: chatId,
+    user_id: userId,
+    permissions: {
       can_send_messages: true,
       can_send_audios: false,
       can_send_documents: false,
@@ -107,112 +124,135 @@ async function applyMediaRestriction(ctx, userId) {
       can_send_voice_notes: false,
       can_send_polls: true,
       can_send_other_messages: false,
-      can_add_web_page_previews: false,
+      can_add_web_page_previews: true,
     },
-    { use_independent_chat_permissions: true }
-  );
+    use_independent_chat_permissions: true,
+  });
 }
 
-function incrementVideoCount(chatId, userId, threadId) {
-  const key = getUserKey(chatId, userId, threadId);
-  const current = state.counts[key] || 0;
-  state.counts[key] = current + 1;
-  return state.counts[key];
-}
-
-function markRestricted(chatId, userId) {
-  const key = `${chatId}:${userId}`;
-  state.restrictedUsers[key] = true;
-}
-
-function isAlreadyRestricted(chatId, userId) {
-  return Boolean(state.restrictedUsers[`${chatId}:${userId}`]);
-}
-
-// Admin command: show help
-bot.command('help', async (ctx) => {
-  await ctx.reply(
-    [
-      'Commands:',
-      '/allowtopic - run this while replying inside a topic to exempt that topic',
-      '/deltopic - run this while replying inside a topic to remove exemption',
-      '/status - show current settings',
-      '',
-      `Video limit per user per non-exempt topic: ${LIMIT}`,
-    ].join('\n')
-  );
-});
-
-// Admin command: exempt current topic
-bot.command('allowtopic', async (ctx) => {
-  const threadId = getThreadId(ctx);
-  if (threadId == null) {
-    return ctx.reply('Reply to a message inside the topic you want to exempt.');
-  }
-  if (!state.exemptTopics.includes(threadId)) {
-    state.exemptTopics.push(threadId);
-    saveState();
-  }
-  return ctx.reply(`Topic ${threadId} is now exempt.`);
-});
-
-// Admin command: remove exemption
-bot.command('deltopic', async (ctx) => {
-  const threadId = getThreadId(ctx);
-  if (threadId == null) {
-    return ctx.reply('Reply to a message inside the topic you want to remove from exemptions.');
-  }
-  state.exemptTopics = state.exemptTopics.filter((id) => id !== threadId);
-  saveState();
-  return ctx.reply(`Topic ${threadId} is no longer exempt.`);
-});
-
-bot.command('status', async (ctx) => {
-  const exempt = state.exemptTopics.length ? state.exemptTopics.join(', ') : 'none';
-  return ctx.reply(`Limit: ${LIMIT}\nExempt topics: ${exempt}`);
-});
-
-// Count only video posts in non-exempt forum topics.
-bot.on('video', async (ctx) => {
-  const chatId = ctx.chat?.id;
-  const userId = ctx.from?.id;
+async function handleMessage(env, message) {
+  const chatId = message?.chat?.id;
+  const userId = message?.from?.id;
   if (!chatId || !userId) return;
 
-  const threadId = getThreadId(ctx);
-  if (isExemptTopic(threadId)) return;
+  const threadId = getThreadId(message);
+  const exemptSet = getExemptTopics(env);
+  const limit = getLimit(env);
 
-  const newCount = incrementVideoCount(chatId, userId, threadId);
-  saveState();
+  // Admin commands for manual control.
+  const textValue = typeof message.text === 'string' ? message.text.trim() : '';
+  if (textValue === '/status') {
+    const admin = await isAdmin(env, chatId, userId);
+    const counts = await env.STATE.list({ prefix: `count:${chatId}:` });
+    return { reply: admin ? `Limit: ${limit}\nKV count keys: ${counts.keys.length}` : 'Limit: hidden' };
+  }
 
-  if (newCount > LIMIT && !isAlreadyRestricted(chatId, userId)) {
-    try {
-      await applyMediaRestriction(ctx, userId);
-      markRestricted(chatId, userId);
-      saveState();
-      await ctx.reply(
-        `User ${ctx.from.first_name} reached the video limit (${LIMIT}). Media is now restricted, text is still allowed.`,
-        { reply_to_message_id: ctx.message.message_id }
-      );
-    } catch (err) {
-      console.error('Failed to restrict user:', err);
-      await ctx.reply('I could not restrict that user. Check that I am an admin with restrict permissions.');
+  if (textValue === '/allowtopic' || textValue === '/deltopic') {
+    const admin = await isAdmin(env, chatId, userId);
+    if (!admin) return { reply: 'Admin only.' };
+    if (threadId == null) return { reply: 'Open the command inside the topic you want to change.' };
+
+    const list = parseCsvIds(env.EXEMPT_TOPICS);
+    const set = new Set(list);
+    if (textValue === '/allowtopic') set.add(threadId);
+    if (textValue === '/deltopic') set.delete(threadId);
+
+    await kvPutJSON(env, 'config:exempt_topics', [...set]);
+    return { reply: `Saved topic ${threadId}.` };
+  }
+
+  // Apply runtime override from KV if you use the commands above.
+  const savedExempt = await kvGetJSON(env, 'config:exempt_topics');
+  const runtimeExemptSet = Array.isArray(savedExempt)
+    ? new Set(savedExempt.map((n) => Number(n)).filter((n) => Number.isInteger(n)))
+    : exemptSet;
+
+  if (message.video && !isExemptTopic(threadId, runtimeExemptSet)) {
+    const key = countKey(chatId, userId, threadId);
+    const current = (await kvGetJSON(env, key)) || { count: 0 };
+    current.count += 1;
+    await kvPutJSON(env, key, current);
+
+    if (current.count > limit) {
+      const rKey = restrictedKey(chatId, userId);
+      const already = await kvGetJSON(env, rKey);
+      if (!already) {
+        await restrictMediaOnly(env, chatId, userId);
+        await kvPutJSON(env, rKey, { restricted: true, at: Date.now(), threadId });
+        return { reply: `User reached the video limit (${limit}). Media is now restricted.` };
+      }
     }
   }
-});
 
-// Optional: log when other media types are posted in restricted topics.
-// This does not block them; it just leaves room for future logic.
-bot.on(['photo', 'video_note', 'document', 'animation', 'audio'], async () => {
-  // No-op on purpose.
-});
+  return { reply: null };
+}
 
-bot.catch((err) => {
-  console.error('Bot error:', err);
-});
+async function setWebhookIfRequested(env, url) {
+  const hookUrl = url instanceof URL ? url : new URL(url);
+  const endpoint = `https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      url: `${hookUrl.origin}/webhook/${env.WEBHOOK_SECRET}`,
+      secret_token: env.WEBHOOK_SECRET,
+      drop_pending_updates: true,
+      allowed_updates: ['message'],
+    }),
+  });
+  return await res.json();
+}
 
-bot.launch().then(() => {
-  console.log(`Bot started. Limit=${LIMIT}. State file: ${STATE_FILE}`);
-});
+export default {
+  async fetch(request, env, ctx) {
+    if (!env.BOT_TOKEN) return text('Missing BOT_TOKEN', { status: 500 });
+    if (!env.WEBHOOK_SECRET) return text('Missing WEBHOOK_SECRET', { status: 500 });
+    if (!env.STATE) return text('Missing KV binding STATE', { status: 500 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    const url = new URL(request.url);
+
+    // Simple health check.
+    if (request.method === 'GET' && url.pathname === '/') {
+      return text('ok');
+    }
+
+    // One-time webhook setup route.
+    // Visit /set-webhook?secret=YOUR_SETUP_SECRET (or just use it after deployment).
+    if (request.method === 'GET' && url.pathname === '/set-webhook') {
+      const secret = url.searchParams.get('secret');
+      const setupSecret = env.SETUP_SECRET || env.WEBHOOK_SECRET;
+      if (secret !== setupSecret) return text('forbidden', { status: 403 });
+      const result = await setWebhookIfRequested(env, url);
+      return json(result);
+    }
+
+    // Telegram webhook endpoint.
+    if (request.method === 'POST' && url.pathname === `/webhook/${env.WEBHOOK_SECRET}`) {
+      const secretHeader = request.headers.get('x-telegram-bot-api-secret-token');
+      if (secretHeader !== env.WEBHOOK_SECRET) {
+        return text('forbidden', { status: 403 });
+      }
+
+      const update = await request.json();
+      const message = update?.message;
+      if (message) {
+        try {
+          const result = await handleMessage(env, message);
+          if (result?.reply) {
+            await telegram(env, 'sendMessage', {
+              chat_id: message.chat.id,
+              message_thread_id: getThreadId(message) ?? undefined,
+              text: result.reply,
+            });
+          }
+        } catch (err) {
+          console.error('update handling failed:', err);
+        }
+      }
+
+      return text('ok');
+    }
+
+    return text('not found', { status: 404 });
+  },
+};
