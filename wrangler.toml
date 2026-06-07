@@ -1,0 +1,3 @@
+name = "securitie"            # <- change this to the exact Worker name shown in your Cloudflare dashboard if different
+main = "main.js"
+compatibility_date = "2025-12-08"
